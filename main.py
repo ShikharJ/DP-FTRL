@@ -36,6 +36,8 @@ from nn import get_nn
 from data import get_data
 import utils
 from utils import EasyDict
+import random
+from evaluator import get_eps_audit
 
 
 FLAGS = flags.FLAGS
@@ -59,6 +61,12 @@ flags.DEFINE_integer('report_nimg', -1, 'Write to tb every this number of sample
 
 flags.DEFINE_integer('run', 1, '(run-1) will be used for random seed.')
 flags.DEFINE_string('dir', '.', 'Directory to write the results.')
+flags.DEFINE_integer('m', 1000, 'Number of canaries.')
+flags.DEFINE_integer('kin', 10, 'Number of members guesses.')
+flags.DEFINE_integer('kout', 10, 'Number of non-member guesses.')
+flags.DEFINE_float('p', 0.2, 'Centum minus confidence.')
+flags.DEFINE_float('delta', 0.00001, 'Delta for DP-guarantee.')
+flags.DEFINE_boolean('black_box', True, 'If true, run with black box auditing process.')
 
 
 def main(argv):
@@ -76,15 +84,15 @@ def main(argv):
 
     # Hyperparameters for training.
     epochs = FLAGS.epochs
-    batch = FLAGS.batch_size if FLAGS.batch_size > 0 else ntrain
-    num_batches = ntrain // batch
+    batch = FLAGS.batch_size if FLAGS.batch_size > 0 else ntrain - (FLAGS.m // 2)
+    num_batches = (ntrain - (FLAGS.m // 2)) // batch
     noise_multiplier = FLAGS.noise_multiplier if FLAGS.dp_ftrl else -1
     clip = FLAGS.l2_norm_clip if FLAGS.dp_ftrl else -1
     lr = FLAGS.learning_rate
     if not FLAGS.restart:
         FLAGS.tree_completion = False
 
-    report_nimg = ntrain if FLAGS.report_nimg == -1 else FLAGS.report_nimg
+    report_nimg = (ntrain - (FLAGS.m // 2)) if FLAGS.report_nimg == -1 else FLAGS.report_nimg
     assert report_nimg % batch == 0
 
     # Get the name of the output directory.
@@ -98,27 +106,50 @@ def main(argv):
                                         )
                            )
     print('Model dir', log_dir)
+    zero_level_losses = []
+    final_level_losses = []
 
     # Class to output batches of data
     class DataStream:
-        def __init__(self):
-            self.shuffle()
+        def __init__(self, choices):
+            self.choices = choices
+            self.shuffle(0)
 
-        def shuffle(self):
+        def shuffle(self, shuffle_counter):
             self.perm = np.random.permutation(ntrain)
             self.i = 0
+            if shuffle_counter == 0:
+                self.include = []
+                self.exclude = []
+                self.inclusion = [1] * FLAGS.m
+                for i in range(FLAGS.m):
+                    self.inclusion[i] = random.choice(self.choices)
+                for i, indexed_value in enumerate(self.perm):
+                    if i == FLAGS.m:
+                        break
+                    if self.inclusion[i] == 0:
+                        self.exclude.append(indexed_value)
+                    else:
+                        self.include.append(indexed_value)
+            self.batch_idxs = [x for x in self.perm if x not in self.exclude]
 
         def __call__(self):
             if self.i == num_batches:
                 self.i = 0
-            batch_idx = self.perm[self.i * batch:(self.i + 1) * batch]
+            batch_idx = self.batch_idxs[self.i * batch:(self.i + 1) * batch]
             self.i += 1
             return trainset.image[batch_idx], trainset.label[batch_idx]
+    
+        def get_inclusions_exclusions(self):
+            return self.exclude, self.include
 
-    data_stream = DataStream()
+        def get_data_at_index(self, index):
+            return [trainset.image[index]], [trainset.label[index]]
+
+    data_stream = DataStream(choices = [0, 1])
 
     # Function to conduct training for one epoch
-    def train_loop(model, device, optimizer, cumm_noise, epoch, writer):
+    def train_loop(model, device, optimizer, cumm_noise, epoch, writer, counter):
         model.train()
         criterion = torch.nn.CrossEntropyLoss(reduction='mean')
         losses = []
@@ -144,6 +175,12 @@ def main(argv):
                 acc_train, acc_test = test(model, device)
                 writer.add_scalar('eval/accuracy_test', 100 * acc_test, step)
                 writer.add_scalar('eval/accuracy_train', 100 * acc_train, step)
+                if counter == 0:
+                    print("First Level")
+                    test_under_audit(model, device, criterion, zero_level_losses)
+                if counter == -1:
+                    print("Final Level")
+                    test_under_audit(model, device, criterion, final_level_losses)
                 model.train()
                 print('Step %04d Accuracy %.2f' % (step, 100 * acc_test))
 
@@ -165,9 +202,50 @@ def main(argv):
                     accs[i] += pred.eq(target.view_as(pred)).sum().item()
                 accs[i] /= dataset.image.shape[0]
         return accs
+    
+    # Function for evaluating the model to get training and test accuracies
+    def test_under_audit(model, device, criterion, loss_vector, desc='Evaluating'):
+        model.eval()
+        with torch.no_grad():
+            excl_ids, incl_ids = data_stream.get_inclusions_exclusions()
+            for iter in range(len(excl_ids)):
+                data, target = data_stream.get_data_at_index(excl_ids[iter])
+                data = torch.Tensor(data).to(device)
+                target = torch.LongTensor(target).to(device)
+
+                output = model(data)
+                loss = criterion(output, target)
+                loss_vector.append(loss.item())
+            for iter in range(len(incl_ids)):
+                data, target = data_stream.get_data_at_index(incl_ids[iter])
+                data = torch.Tensor(data).to(device)
+                target = torch.LongTensor(target).to(device)
+
+                output = model(data)
+                loss = criterion(output, target)
+                loss_vector.append(loss.item())
+
+    # Function for auditing the trained model given the inclusion and exclusion ids.
+    def get_scores(indices, kin, kout):
+        correct = 0
+        incorrect = 0
+        for i in range(kin):
+            index = indices[i]
+            if index >= FLAGS.m // 2:
+                correct += 1
+            else:
+                incorrect += 1
+        for i in range(kout):
+            index = indices[-(i + 1)]
+            if index <= FLAGS.m // 2:
+                correct += 1
+            else:
+                incorrect += 1
+        assert correct + incorrect == kin + kout
+        return kin + kout, correct
 
     # Get model for different dataset
-    device = torch.device('cuda')
+    device = torch.device('cpu')
     model = get_nn({'mnist': 'small_nn',
                     'emnist_merge': 'small_nn',
                     'cifar10': 'vgg128'}[FLAGS.data],
@@ -182,7 +260,7 @@ def main(argv):
     optimizer = FTRLOptimizer(model.parameters(), momentum=FLAGS.momentum,
                               record_last_noise=FLAGS.restart > 0 and FLAGS.tree_completion)
     if FLAGS.dp_ftrl:
-        privacy_engine = PrivacyEngine(model, batch_size=batch, sample_size=ntrain, alphas=[], noise_multiplier=0, max_grad_norm=clip)
+        privacy_engine = PrivacyEngine(model, batch_size=batch, sample_size=(ntrain - (FLAGS.m // 2)), alphas=[], noise_multiplier=0, max_grad_norm=clip)
         privacy_engine.attach(optimizer)
     shapes = [p.shape for p in model.parameters()]
 
@@ -200,7 +278,7 @@ def main(argv):
     # The training loop.
     writer = SummaryWriter(os.path.join(log_dir, 'tb'))
     for epoch in range(epochs):
-        train_loop(model, device, optimizer, cumm_noise, epoch, writer)
+        train_loop(model, device, optimizer, cumm_noise, epoch, writer, 0 if epoch == 0 else -1)
 
         if epoch + 1 == epochs:
             break
@@ -214,9 +292,25 @@ def main(argv):
                     last_noise = cumm_noise.proceed_until(next_pow_2)
             optimizer.restart(last_noise)
             cumm_noise = get_cumm_noise(FLAGS.effi_noise)
-            data_stream.shuffle()  # shuffle the data only when restart
+            data_stream.shuffle(1)  # shuffle the data only when restart
     writer.close()
-
+    scores = []
+    if FLAGS.black_box == True:
+        # Calculate scores
+        emp_eps = []
+        ah_counter = 0
+        for i in range(FLAGS.m):
+            if zero_level_losses[i] < final_level_losses[i]:
+                ah_counter += 1
+            scores.append(zero_level_losses[i] - final_level_losses[i])
+        indices = sorted(range(len(scores)), key=lambda k: scores[k], reverse=True)
+        r, v = get_scores(indices, FLAGS.kin, FLAGS.kout)
+        print(FLAGS.m, r, v, FLAGS.delta, FLAGS.p, ah_counter)
+        eps_value = get_eps_audit(FLAGS.m, r, v, FLAGS.delta, FLAGS.p)
+        emp_eps.append(eps_value)
+        print(emp_eps)
+    else:
+        pass
 
 if __name__ == '__main__':
     utils.setup_tf()
