@@ -61,10 +61,11 @@ flags.DEFINE_integer('report_nimg', -1, 'Write to tb every this number of sample
 
 flags.DEFINE_integer('run', 1, '(run-1) will be used for random seed.')
 flags.DEFINE_string('dir', '.', 'Directory to write the results.')
-flags.DEFINE_integer('m', 1000, 'Number of canaries.')
-flags.DEFINE_integer('kin', 10, 'Number of members guesses.')
-flags.DEFINE_integer('kout', 10, 'Number of non-member guesses.')
-flags.DEFINE_float('p', 0.2, 'Centum minus confidence.')
+flags.DEFINE_integer('m', 10000, 'Number of canaries.')
+flags.DEFINE_integer('kin', 100, 'Number of members guesses.')
+flags.DEFINE_integer('kout', 100, 'Number of non-member guesses.')
+flags.DEFINE_integer('limit_train', -1, 'If not -1, limit training set size to the number of canaries.')
+flags.DEFINE_float('p', 0.1, 'Centum minus confidence.')
 flags.DEFINE_float('delta', 0.00001, 'Delta for DP-guarantee.')
 flags.DEFINE_boolean('black_box', True, 'If true, run with black box auditing process.')
 
@@ -80,6 +81,8 @@ def main(argv):
 
     # Data
     trainset, testset, ntrain, nclass = get_data(FLAGS.data)
+    if FLAGS.limit_train != -1:
+        ntrain = FLAGS.m
     print('Training set size', trainset.image.shape)
 
     # Hyperparameters for training.
@@ -178,7 +181,7 @@ def main(argv):
                 if counter == 0:
                     print("First Level")
                     test_under_audit(model, device, criterion, zero_level_losses)
-                if counter == -1:
+                if counter == 1:
                     print("Final Level")
                     test_under_audit(model, device, criterion, final_level_losses)
                 model.train()
@@ -237,7 +240,7 @@ def main(argv):
                 incorrect += 1
         for i in range(kout):
             index = indices[-(i + 1)]
-            if index <= FLAGS.m // 2:
+            if index < FLAGS.m // 2:
                 correct += 1
             else:
                 incorrect += 1
@@ -278,7 +281,12 @@ def main(argv):
     # The training loop.
     writer = SummaryWriter(os.path.join(log_dir, 'tb'))
     for epoch in range(epochs):
-        train_loop(model, device, optimizer, cumm_noise, epoch, writer, 0 if epoch == 0 else -1)
+        if epoch == 0:
+            train_loop(model, device, optimizer, cumm_noise, epoch, writer, 0)
+        elif epoch == epochs - 1:
+            train_loop(model, device, optimizer, cumm_noise, epoch, writer, 1)
+        else:
+            train_loop(model, device, optimizer, cumm_noise, epoch, writer, -1)
 
         if epoch + 1 == epochs:
             break
